@@ -25,201 +25,207 @@ pub fn Parser(comptime T: type) type {
     return struct {
         reader: T,
         allocator: std.mem.Allocator,
-
+        c: ?u8 = null,
         stopped: bool = false,
 
         pub fn init(reader: T, allocator: std.mem.Allocator) @This() {
             return .{ .reader = reader, .allocator = allocator };
         }
 
-        pub fn parse(self: *@This()) !?defs.Event {
-            if (self.stopped) return null;
-
-            while (true) {
-                var ch = self.next() catch return error.EndOfStream;
-                const c = &ch;
-
-                switch (c.*) {
-                    // Simai ignores whitespace.
-                    ' ', '\t', '\r', '\n' => continue,
-
-                    '(' => return .{ .set_bpm = try self.parseDecimalToTerminator(')', error.ExpectedSetBpmEnd) },
-                    '{' => return .{ .set_unit = try self.parseDecimalToTerminator('}', error.ExpectedSetUnitEnd) },
-                    ',' => return .{ .note = .rest },
-
-                    inline 'A'...'E' => |region| {
-                        c.* = self.next() catch if (region == 'E') {
-                            self.stopped = true;
-                            return null;
-                        } else return error.EndOfStream;
-
-                        const area: defs.TouchArea = area: {
-                            const area_ = switch (region) {
-                                // C1 and C2 are accepted, but they are just treated like C. Why??
-                                'C' => switch (c.*) {
-                                    // have to use @as here because otherwise comptime weirdness happens
-                                    '1' => defs.TouchArea{ .c = @as(u1, 0) },
-                                    '2' => defs.TouchArea{ .c = @as(u1, 1) },
-                                    else => break :area .{ .c = null }, // keep c
-                                },
-                                else => if (posFromChar(c.*)) |pos|
-                                    @unionInit(defs.TouchArea, &.{std.ascii.toLower(region)}, pos)
-                                else
-                                    return error.InvalidCharacter,
-                            };
-                            c.* = try self.next();
-                            break :area area_;
-                        };
-
-                        return .{
-                            .note = try self.parseNote(c.*, .{
-                                .type = .{ .touch = .{ .area = area } },
-                            }),
-                        };
-                    },
-
-                    else => if (posFromChar(c.*)) |pos| {
-                        const n = self.next() catch null;
-                        return .{ .note = try self.parseNote(n, .{
-                            .type = .{ .tap = .{ .pos = pos } },
-                        }) };
-                    } else return error.InvalidCharacter,
-                }
-            }
-        }
-
         fn next(self: *@This()) !u8 {
             return self.reader.reader().readByte();
         }
 
-        fn parseNote(self: *@This(), c_: ?u8, state_: ParseNoteState) !defs.Note {
-            var state, var ch: ?u8 = .{ state_, c_ };
+        pub fn parse(self: *@This()) !?defs.Event {
+            if (self.stopped) return null;
+            const c = if (self.c) |c_| c: {
+                self.c = null;
+                break :c c_;
+            } else self.next() catch return null;
 
-            while (ch) |*c| {
-                switch (c.*) {
-                    ',' => break,
-                    'h' => {
-                        state.type = switch (state.type) {
-                            .tap => |tap| .{ .hold = .{ .pos = tap.pos } },
-                            .touch => |touch| .{ .touch_hold = .{ .area = touch.area } },
-                            .hold, .slide, .touch_hold => return error.IncompatibleNoteTypes,
-                        };
-                        try state.validateFlagCombination();
-                    },
-                    'b' => {
-                        switch (state.type) {
-                            .tap => {},
-                            // Flags for holds must occur before the duration.
-                            .hold => |v| if (v.duration) |_| return error.UnexpectedFlag,
-                            // Flags for slides must occur *after* the duration. Why, simai??
-                            .slide => |v| if (v.time == null) return error.UnexpectedFlag,
-                            .touch, .touch_hold => return error.UnexpectedFlag,
-                        }
-                        state.flags.is_break = true;
-                    },
-                    'f' => {
-                        switch (state.type) {
-                            .touch => {},
-                            // Flags for holds must occur before the duration.
-                            .touch_hold => |v| if (v.duration) |_| return error.UnexpectedFlag,
-                            .tap, .hold, .slide => return error.UnexpectedFlag,
-                        }
-                        state.flags.is_fireworks = true;
-                    },
-                    'x' => {
-                        switch (state.type) {
-                            .tap => {},
-                            // Flags for holds must occur before the duration.ser.zig:158:31: error: no field named 'is_star' in struct 'parser.ParseNoteState'
-                            .hold => |v| if (v.duration) |_| return error.UnexpectedFlag,
-                            .slide, .touch, .touch_hold => return error.UnexpectedFlag,
-                        }
-                        state.flags.is_ex = true;
-                    },
-                    '$' => {
-                        switch (state.type) {
-                            .tap => {},
-                            .hold, .slide, .touch, .touch_hold => return error.UnexpectedFlag,
-                        }
-                        state.flags.is_star = true;
+            sw: switch (c) {
+                // Simai ignores whitespace.
+                ' ', '\t', '\r', '\n' => continue :sw self.next() catch return null,
 
-                        c.* = try self.next();
-                        if (c.* == '$') {
-                            state.flags.is_rotating_star = true;
-                        }
+                '(' => return .{ .set_bpm = try self.parseDecimalToTerminator(')', error.ExpectedSetBpmEnd) },
+                '{' => return .{ .set_unit = try self.parseDecimalToTerminator('}', error.ExpectedSetUnitEnd) },
+                ',' => return .{ .note = .rest },
 
-                        continue;
-                    },
-                    '[' => {
-                        switch (state.type) {
-                            .tap, .touch => return error.UnexpectedDurationStart,
-                            .slide => |*slide| slide.time = try self.parseSlideTime(),
-                            inline .hold, .touch_hold => |*hold| hold.duration = try self.parseDuration(),
-                        }
-                    },
-                    // TODO: parse multiple slides
-                    else => {
-                        var segments = std.ArrayList(defs.Slide.Segment).init(self.allocator);
+                inline 'A'...'E' => |region| {
+                    const n = self.next() catch if (region == 'E') {
+                        self.stopped = true;
+                        return null;
+                    } else return error.EndOfStream;
 
-                        const pos = switch (state.type) {
-                            .tap => |tap| tap.pos,
-                            .touch, .hold, .slide, .touch_hold => return error.IncompatibleNoteTypes,
-                        };
-                        var current_start = pos;
+                    const area: defs.TouchArea = switch (region) {
+                        // C1 and C2 are accepted, but they are just treated like C. Why??
+                        'C' => switch (n) {
+                            // have to use @as here because otherwise comptime weirdness happens
+                            '1' => .{ .c = @as(u1, 0) },
+                            '2' => .{ .c = @as(u1, 1) },
+                            else => keep_c: {
+                                self.c = n;
+                                break :keep_c .{ .c = null };
+                            },
+                        },
+                        else => if (posFromChar(n)) |pos|
+                            @unionInit(defs.TouchArea, &.{std.ascii.toLower(region)}, pos)
+                        else
+                            return error.InvalidCharacter,
+                    };
 
-                        while (true) {
-                            const shape = try self.parseSlideShape(c);
-                            const dest_pos = posFromChar(c.*) orelse return error.ExpectedSlideEndPos;
-
-                            try shape.validate(current_start, dest_pos);
-                            try segments.append(.{ .shape = shape, .dest_pos = dest_pos });
-
-                            current_start = dest_pos;
-
-                            c.* = try self.next();
-                            if (c.* == '[') break;
-                        }
-
-                        state.type = .{ .slide = .{
-                            .pos = pos,
-                            .segments = segments,
-                        } };
-                        try state.validateFlagCombination();
-                        continue;
-                    },
-                }
-                ch = self.next() catch null;
-            }
-
-            return switch (state.type) {
-                .tap => |tap| .{ .tap = .{ .pos = tap.pos, .flags = .{
-                    .is_break = state.flags.is_break,
-                    .is_ex = state.flags.is_ex,
-                    .is_star = state.flags.is_star,
-                    .is_rotating_star = state.flags.is_rotating_star,
-                } } },
-                .hold => |hold| .{ .hold = .{ .duration = hold.duration orelse return error.ExpectedDuration, .pos = hold.pos, .flags = .{
-                    .is_break = state.flags.is_break,
-                    .is_ex = state.flags.is_ex,
-                } } },
-                .slide => |slide| {
-                    const time = slide.time orelse return error.ExpectedDuration;
-                    return .{ .slide = .{ .delay = time.delay, .duration = time.duration, .segments = slide.segments, .start_pos = slide.pos, .flags = .{
-                        .is_break = state.flags.is_break,
-                    } } };
+                    return .{ .note = try self.parseNote(.{
+                        .touch = .{ .area = area },
+                    }) };
                 },
-                .touch => |touch| .{ .touch = .{
-                    .area = touch.area,
-                    .flags = .{ .is_fireworks = state.flags.is_fireworks },
-                } },
-                .touch_hold => |touch_hold| .{ .touch_hold = .{
-                    .area = touch_hold.area,
-                    .duration = touch_hold.duration orelse return error.ExpectedDuration,
-                    .flags = .{ .is_fireworks = state.flags.is_fireworks },
-                } },
-            };
+
+                else => |char| {
+                    return if (posFromChar(char)) |pos|
+                        .{ .note = try self.parseNote(.{
+                            .tap = .{ .pos = pos },
+                        }) }
+                    else
+                        error.InvalidCharacter;
+                },
+            }
         }
 
-        fn parseDuration(self: *@This()) !defs.Duration {
+        fn parseNote(self: *@This(), state_: ParseNoteState) !defs.Note {
+            var state = state_;
+            const c = if (self.c) |c_| c: {
+                self.c = null;
+                break :c c_;
+            } else self.next() catch return state.finalize();
+
+            sw: switch (c) {
+                ',' => {},
+
+                'h' => {
+                    state = switch (state) {
+                        .tap => |tap| .{ .hold = .{
+                            .pos = tap.pos,
+                            .flags = try translateFlags(tap.flags, defs.Hold.Flags),
+                        } },
+                        .touch => |touch| .{ .touch_hold = .{
+                            .area = touch.area,
+                            .flags = try translateFlags(touch.flags, defs.TouchHold.Flags),
+                        } },
+                        .hold, .slide, .touch_hold => return error.InvalidNoteType,
+                    };
+                    continue :sw self.next() catch break;
+                },
+
+                'b' => switch (state) {
+                    inline .tap, .hold, .slide => |*v, tag| {
+                        // Flags for holds must occur before the duration.
+                        if (tag == .hold and v.duration != null) return error.InvalidFlagCombination;
+                        // Flags for slides must occur *after* the duration. Why, simai??
+                        if (tag == .slide and v.time == null) return error.InvalidFlagCombination;
+
+                        v.flags.is_break = true;
+                        continue :sw self.next() catch break;
+                    },
+                    // Flags for holds must occur before the duration.
+                    .touch, .touch_hold => return error.InvalidFlagCombination,
+                },
+
+                'f' => switch (state) {
+                    inline .touch, .touch_hold => |*v, tag| {
+                        // Flags for holds must occur before the duration.
+                        if (tag == .touch_hold and v.duration != null) return error.InvalidFlagCombination;
+
+                        v.flags.is_fireworks = true;
+                        continue :sw self.next() catch break;
+                    },
+                    .tap, .hold, .slide => return error.InvalidFlagCombination,
+                },
+
+                'x' => switch (state) {
+                    inline .tap, .hold => |*v, tag| {
+                        // Flags for holds must occur before the duration
+                        if (tag == .hold and v.duration != null) return error.InvalidFlagCombination;
+
+                        v.flags.is_ex = true;
+                        continue :sw self.next() catch break;
+                    },
+                    .slide, .touch, .touch_hold => return error.InvalidFlagCombination,
+                },
+
+                '$' => switch (state) {
+                    .tap => |*v| {
+                        v.flags.is_star = true;
+
+                        switch (self.next() catch break) {
+                            '$' => {
+                                v.flags.is_rotating_star = true;
+                                continue :sw self.next() catch break;
+                            },
+                            else => |ch| continue :sw ch,
+                        }
+                    },
+                    .hold, .slide, .touch, .touch_hold => return error.InvalidFlagCombination,
+                },
+
+                '[' => {
+                    switch (state) {
+                        .tap, .touch => return error.UnexpectedDurationStart,
+                        .slide => |*slide| slide.time = try self.parseSlideTime(),
+                        inline .hold, .touch_hold => |*hold| hold.duration = try self.parseHoldDuration(),
+                    }
+                    continue :sw self.next() catch break;
+                },
+
+                '-', '>', '<', '^', 'v', 'V', 'w', 'p', 'q' => switch (state) {
+                    .tap => |v| {
+                        var ch = c;
+                        const segments = self.parseSlideSegments(&ch, v.pos) catch |e| switch (e) {
+                            error.EndOfStream => break :sw,
+                            else => return e,
+                        };
+                        errdefer segments.deinit();
+
+                        state = .{ .slide = .{
+                            .pos = v.pos,
+                            .segments = segments,
+                            .flags = try translateFlags(v.flags, defs.Slide.Flags),
+                        } };
+                        continue :sw ch;
+                    },
+                    .touch, .hold, .slide, .touch_hold => return error.IncompatibleNoteTypes,
+                },
+                else => return error.InvalidCharacter,
+            }
+
+            return try state.finalize();
+        }
+
+        fn parseSlideSegments(self: *@This(), c: *u8, pos: defs.Position) !std.ArrayList(defs.Slide.Segment) {
+            var start = pos;
+
+            var segments = std.ArrayList(defs.Slide.Segment).init(self.allocator);
+            errdefer segments.deinit();
+
+            // TODO: parse multiple slides
+            while (true) {
+                const shape = self.parseSlideShape(c) catch |e| switch (e) {
+                    // We hit something that's not a slide character. That's fine.
+                    error.InvalidCharacter => break,
+                    else => return e,
+                };
+                const dest_pos = posFromChar(c.*) orelse return error.ExpectedSlideEndPos;
+
+                try shape.validate(start, dest_pos);
+                try segments.append(.{ .shape = shape, .dest_pos = dest_pos });
+
+                start = dest_pos;
+
+                c.* = try self.next();
+            }
+
+            return segments;
+        }
+
+        fn parseHoldDuration(self: *@This()) !defs.Duration {
             const time = try self.parseDurationInner(false);
             return time.duration;
         }
@@ -234,7 +240,6 @@ pub fn Parser(comptime T: type) type {
 
             var c: u8 = undefined;
             var time: ParseNoteState.SlideTime = .{
-                .delay = .one_beat,
                 .duration = undefined,
             };
 
@@ -245,66 +250,33 @@ pub fn Parser(comptime T: type) type {
 
                     if (with_delay and c == '#') {
                         const delay = num orelse return error.ExpectedDelay;
-                        time.delay = .{ .seconds = delay };
+                        time.delay = delay;
 
                         if (num2) |_| return error.DuplicateBpmMarkers;
 
                         const num3 = try self.parseDecimal(&c);
-                        switch (c) {
-                            '#' => {
-                                // delay##bpm#unit:length
-                                const bpm = num3 orelse return error.ExpectedBpm;
-                                const unit = try self.parseDecimal(&c) orelse return error.ExpectedUnit;
-                                if (c != ':') return error.ExpectedLength;
-                                const length = try self.parseDecimal(&c) orelse return error.ExpectedLength;
+                        if (c == '#') {
+                            // delay##bpm#unit:length
+                            const bpm = num3 orelse return error.ExpectedBpm;
+                            const unit = try self.parseDecimal(&c) orelse return error.ExpectedUnit;
+                            if (c != ':') return error.ExpectedLength;
+                            const length = try self.parseDecimal(&c) orelse return error.ExpectedLength;
 
-                                time.duration = .{ .measures = .{
-                                    .bpm = bpm,
-                                    .unit = unit,
-                                    .length = length,
-                                } };
-                            },
-                            ':' => {
-                                // delay##unit:length
-                                const unit = num3 orelse return error.ExpectedUnit;
-                                const length = try self.parseDecimal(&c) orelse return error.ExpectedLength;
-
-                                time.duration = .{ .measures = .{
-                                    .bpm = null,
-                                    .unit = unit,
-                                    .length = length,
-                                } };
-                            },
-                            ']' => {
-                                // delay##seconds
-                                const seconds = num3 orelse return error.ExpectedSeconds;
-                                time.duration = .{ .seconds = seconds };
-                            },
-                            else => return error.InvalidCharacter,
+                            time.duration = .{ .measures = .{
+                                .bpm = bpm,
+                                .unit = unit,
+                                .length = length,
+                            } };
+                        } else {
+                            time.duration = try self.parseDuration(null, num3, &c);
                         }
                     } else {
-                        switch (c) {
-                            ':' => {
-                                // bpm#unit:length
-                                const bpm = num orelse return error.ExpectedBpm;
-                                const unit = num2 orelse return error.ExpectedUnit;
-                                const length = try self.parseDecimal(&c) orelse return error.ExpectedLength;
-
-                                time.duration = .{ .measures = .{
-                                    .bpm = bpm,
-                                    .unit = unit,
-                                    .length = length,
-                                } };
-                            },
-                            ']' => {
-                                // #seconds
-                                if (num) |_| return error.ExpectedLength;
-                                const seconds = num2 orelse return error.ExpectedSeconds;
-
-                                time.duration = .{ .seconds = seconds };
-                            },
+                        const bpm = switch (c) {
+                            ':' => num orelse return error.ExpectedBpm,
+                            ']' => if (num) |_| return error.ExpectedLength else null,
                             else => return error.InvalidCharacter,
-                        }
+                        };
+                        time.duration = try self.parseDuration(bpm, num2, &c);
                     }
                 },
                 ':' => {
@@ -322,6 +294,27 @@ pub fn Parser(comptime T: type) type {
             }
 
             return time;
+        }
+
+        fn parseDuration(self: *@This(), bpm: ?f32, unit_or_seconds: ?f32, c: *u8) !defs.Duration {
+            switch (c.*) {
+                ':' => {
+                    const unit = unit_or_seconds orelse return error.ExpectedUnit;
+                    const length = try self.parseDecimal(c) orelse return error.ExpectedLength;
+
+                    return .{ .measures = .{
+                        .bpm = bpm,
+                        .unit = unit,
+                        .length = length,
+                    } };
+                },
+                ']' => {
+                    const seconds = unit_or_seconds orelse return error.ExpectedSeconds;
+
+                    return .{ .seconds = seconds };
+                },
+                else => return error.InvalidCharacter,
+            }
         }
 
         fn parseSlideShape(self: *@This(), c: *u8) !defs.Slide.Shape {
@@ -400,53 +393,87 @@ fn posFromChar(c: u8) ?defs.Position {
     return if (c >= '1' and c <= '8') @truncate(c - '1') else null;
 }
 
-const ParseNoteState = struct {
-    type: Type,
-    flags: packed struct {
-        is_break: bool = false,
-        is_ex: bool = false,
-        is_star: bool = false,
-        is_rotating_star: bool = false,
-        is_fireworks: bool = false,
-    } = .{},
+fn translateFlags(from: anytype, comptime To: type) !To {
+    var t: To = .{};
 
-    const Type = union(enum) {
-        tap: struct {
-            pos: defs.Position,
-        },
-        hold: struct {
-            pos: defs.Position,
-            duration: ?defs.Duration = null,
-        },
-        slide: struct {
-            pos: defs.Position,
-            time: ?SlideTime = null,
-            segments: std.ArrayList(defs.Slide.Segment),
-        },
-        touch: struct {
-            area: defs.TouchArea,
-        },
-        touch_hold: struct {
-            area: defs.TouchArea,
-            duration: ?defs.Duration = null,
-        },
-    };
+    outer: inline for (@typeInfo(@TypeOf(from)).@"struct".fields) |from_field| {
+        if (@field(from, from_field.name)) {
+            inline for (@typeInfo(To).@"struct".fields) |to_field| {
+                if (comptime std.mem.eql(u8, from_field.name, to_field.name)) {
+                    @field(t, to_field.name) = true;
+                    break :outer;
+                }
+            }
+
+            return error.InvalidFlagCombination;
+        }
+    }
+
+    return t;
+}
+
+const ParseNoteState = union(enum) {
+    tap: struct {
+        pos: defs.Position,
+        flags: defs.Tap.Flags = .{},
+    },
+    hold: struct {
+        pos: defs.Position,
+        duration: ?defs.Duration = null,
+        flags: defs.Hold.Flags = .{},
+    },
+    slide: struct {
+        pos: defs.Position,
+        time: ?SlideTime = null,
+        segments: std.ArrayList(defs.Slide.Segment) = undefined,
+        flags: defs.Slide.Flags = .{},
+    },
+    touch: struct {
+        area: defs.TouchArea,
+        flags: defs.Touch.Flags = .{},
+    },
+    touch_hold: struct {
+        area: defs.TouchArea,
+        duration: ?defs.Duration = null,
+        flags: defs.TouchHold.Flags = .{},
+    },
 
     const SlideTime = struct {
-        delay: defs.Slide.Delay = .one_beat,
+        delay: ?f32 = null,
         duration: defs.Duration,
     };
 
-    fn validateFlagCombination(self: *@This()) !void {
-        // Carry over flags. If there are flags that can't exist for the new type, bail.
-        const flags = self.flags;
-        const flags_invalid = switch (self.type) {
-            .tap => flags.is_fireworks,
-            .hold => flags.is_rotating_star or flags.is_star or flags.is_fireworks,
-            .slide => flags.is_ex or flags.is_rotating_star or flags.is_star or flags.is_fireworks,
-            .touch, .touch_hold => flags.is_break or flags.is_ex or flags.is_rotating_star or flags.is_star,
+    fn finalize(self: @This()) !defs.Note {
+        return switch (self) {
+            .tap => |tap| .{ .tap = .{
+                .pos = tap.pos,
+                .flags = tap.flags,
+            } },
+            .hold => |hold| .{ .hold = .{
+                .duration = hold.duration orelse return error.ExpectedDuration,
+                .pos = hold.pos,
+                .flags = hold.flags,
+            } },
+            .slide => |slide| {
+                const time = slide.time orelse return error.ExpectedDuration;
+                return .{ .slide = .{
+                    .delay = time.delay,
+                    .duration = time.duration,
+                    .segments = slide.segments,
+                    .start_pos = slide.pos,
+                    .flags = slide.flags,
+                } };
+            },
+            .touch => |touch| .{ .touch = .{
+                .area = touch.area,
+                .flags = touch.flags,
+            } },
+            .touch_hold => |touch_hold| .{ .touch_hold = .{
+                .area = touch_hold.area,
+                .duration = touch_hold.duration orelse return error.ExpectedDuration,
+                .flags = touch_hold.flags,
+            } },
         };
-        if (flags_invalid) return error.InvalidFlagCombination;
     }
 };
 
@@ -481,7 +508,8 @@ test "tap parses properly" {
 
     for (0..8) |i_| {
         const i: defs.Position = @truncate(i_);
-        try std.testing.expectEqual(i, (try parser.parse()).?.note.tap.pos);
+        const note = try parser.parse();
+        try std.testing.expectEqual(i, note.?.note.tap.pos);
     }
 
     var flags = (try parser.parse()).?.note.tap.flags;
@@ -559,7 +587,7 @@ test "slide duration parses properly" {
             } },
         },
         .{
-            .delay = .{ .seconds = 1.2 },
+            .delay = 1.2,
             .duration = .{ .measures = .{
                 .bpm = null,
                 .unit = 4.0,
@@ -567,11 +595,11 @@ test "slide duration parses properly" {
             } },
         },
         .{
-            .delay = .{ .seconds = 1.2 },
+            .delay = 1.2,
             .duration = .{ .seconds = 6.9 },
         },
         .{
-            .delay = .{ .seconds = 1.2 },
+            .delay = 1.2,
             .duration = .{ .measures = .{
                 .bpm = 150.0,
                 .unit = 4.0,
@@ -621,7 +649,7 @@ test "slide shapes parse properly" {
     var start: defs.Position, var dest: defs.Position = .{ 5, 0 };
 
     try std.testing.expectEqual(start, slide.start_pos);
-    try std.testing.expectEqual(.one_beat, slide.delay);
+    try std.testing.expectEqual(null, slide.delay);
     try std.testing.expectEqual(defs.Duration{ .measures = .{
         .bpm = null,
         .unit = 4.0,
@@ -712,4 +740,29 @@ test "touch holds parse properly" {
     } }, touch_hold.duration);
 
     try std.testing.expect(try parser.parse() == null);
+}
+
+test "invalid flags" {
+    const test_cases = [_][]const u8{
+        "1f",
+        "2$h[2:1]",
+        "3hf[2:1]",
+        // "4-8x[2:1]",
+        // "5-8$[2:1]",
+        // "6-8f[2:1]",
+        "A7b",
+        "B7x",
+        "E7$",
+        "A8bh",
+        "B8hx",
+        "E8h$",
+    };
+
+    for (test_cases) |case| {
+        var parser = initTestParser(case);
+
+        const v = parser.parse();
+        try std.testing.expectError(error.InvalidFlagCombination, v);
+        try std.testing.expect(v catch null == null);
+    }
 }

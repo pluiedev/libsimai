@@ -25,6 +25,16 @@ pub const Note = union(enum) {
     touch: Touch,
     touch_hold: TouchHold,
     each: std.ArrayList(Note),
+
+    fn deinit(self: @This()) void {
+        switch (self) {
+            .slide => |slide| slide.segments.deinit(),
+            .each => |each| {
+                for (each) |e| e.deinit();
+                each.deinit();
+            },
+        }
+    }
 };
 
 // There are only 8 spots on the judgement line.
@@ -83,7 +93,8 @@ pub const Hold = struct {
 pub const Slide = struct {
     /// The amount of delay between the slide head (a tap note) reaches the judgement line
     /// and its trail actually starts moving.
-    delay: Delay,
+    /// If null, defaults to one beat at the specified/default BPM.
+    delay: ?f32,
     /// The duration for which the slide note should appear on the screen,
     duration: Duration,
     /// Start position of the slide note on screen.
@@ -107,11 +118,6 @@ pub const Slide = struct {
         /// Break notes are only worth their full value when hit at the critical perfect
         /// window, which is extra precise than a normal perfect.
         is_break: bool = false,
-    };
-
-    pub const Delay = union(enum) {
-        one_beat,
-        seconds: f32,
     };
 };
 pub const Touch = struct {
